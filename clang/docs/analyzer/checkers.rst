@@ -3354,7 +3354,7 @@ alpha.cplusplus
 .. _alpha-cplusplus-DanglingPtrDeref:
 
 alpha.cplusplus.DanglingPtrDeref (C++)
-""""""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""""""
 Check for dereferences of pointers that refer to an object whose
 lifetime has already ended. Such a pointer is dangling. The checker
 reports it when it is dereferenced and when it is passed to a function.
@@ -3381,8 +3381,9 @@ pointer is used several times then only the first use is reported.
    }
  }
 
-The checker requires end-of-lifetime information from the CFG. It is enabled
-with the ``-analyzer-config cfg-lifetime=true`` option.
+End-of-lifetime information is not included in the CFG by default. Without it
+the checker does not report anything and no error is emitted by the analyzer.
+Use the ``-analyzer-config cfg-lifetime=true`` option to include it.
 
 **Limitations**
 
