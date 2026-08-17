@@ -3248,61 +3248,6 @@ Loss of sign/precision in implicit conversions.
    short X = A; // warn (loss of precision)
  }
 
-.. _alpha-core-DanglingPtrDeref:
-
-alpha.core.DanglingPtrDeref (C, C++)
-""""""""""""""""""""""""""""""""""""
-Check for dereferences of pointers that refer to an object whose
-lifetime has already ended. Such a pointer is dangling. The checker
-reports it when it is dereferenced and when it is passed to a function.
-
-Each object is reported at most once on an execution path. If the same dangling
-pointer is used several times then only the first use is reported.
-
-.. code-block:: cpp
-
- void test_deref() {
-   int *ptr = 0;
-   {
-     int num = 5;
-     ptr = &num;
-   } // note: 'num' is destroyed here
-   *ptr = 6; // warn: use of 'num' after its lifetime ended
- }
-
- void test_in_scope() {
-   int num = 5;
-   int *ptr = &num;
-   {
-     *ptr = 6; // no warning, 'num' is still in scope
-   }
- }
-
-The checker requires end-of-lifetime information from the CFG. It is enabled
-with the ``-analyzer-config cfg-lifetime=true`` option.
-
-**Limitations**
-
-If the analyzer does not inline the called function, for example because its
-definition is not available in the given translation unit, then a dangling
-pointer passed to it is reported even if the function would never dereference
-it. This can lead to false positives.
-
-.. code-block:: cpp
-
- // The definition of the function is not available that is why the analyzer
- // assumes the pointer is used.
- int is_null(int *p);
-
- void argument_example() {
-   int *ptr = 0;
-   {
-     int num = 5;
-     ptr = &num;
-   }
-   is_null(ptr); // false positive: the pointer is compared, not dereferenced
- }
-
 .. _alpha-core-DynamicTypeChecker:
 
 alpha.core.DynamicTypeChecker (ObjC)
@@ -3405,6 +3350,61 @@ remove the const qualifier from the original declaration or use a mutable copy.
 
 alpha.cplusplus
 ^^^^^^^^^^^^^^^
+
+.. _alpha-cplusplus-DanglingPtrDeref:
+
+alpha.cplusplus.DanglingPtrDeref (C++)
+""""""""""""""""""""""""""""""""""""
+Check for dereferences of pointers that refer to an object whose
+lifetime has already ended. Such a pointer is dangling. The checker
+reports it when it is dereferenced and when it is passed to a function.
+
+Each object is reported at most once on an execution path. If the same dangling
+pointer is used several times then only the first use is reported.
+
+.. code-block:: cpp
+
+ void test_deref() {
+   int *ptr = 0;
+   {
+     int num = 5;
+     ptr = &num;
+   } // note: 'num' is destroyed here
+   *ptr = 6; // warn: use of 'num' after its lifetime ended
+ }
+
+ void test_in_scope() {
+   int num = 5;
+   int *ptr = &num;
+   {
+     *ptr = 6; // no warning, 'num' is still in scope
+   }
+ }
+
+The checker requires end-of-lifetime information from the CFG. It is enabled
+with the ``-analyzer-config cfg-lifetime=true`` option.
+
+**Limitations**
+
+If the analyzer does not inline the called function, for example because its
+definition is not available in the given translation unit, then a dangling
+pointer passed to it is reported even if the function would never dereference
+it. This can lead to false positives.
+
+.. code-block:: cpp
+
+ // The definition of the function is not available that is why the analyzer
+ // assumes the pointer is used.
+ int is_null(int *p);
+
+ void argument_example() {
+   int *ptr = 0;
+   {
+     int num = 5;
+     ptr = &num;
+   }
+   is_null(ptr); // false positive: the pointer is compared, not dereferenced
+ }
 
 .. _alpha-cplusplus-DeleteWithNonVirtualDtor:
 
