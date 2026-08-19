@@ -3358,7 +3358,9 @@ alpha.cplusplus.DanglingPtrDeref (C++)
 Check for dereferences of pointers that refer to an object whose
 lifetime has already ended. Such a pointer is dangling. The checker
 reports it when it is dereferenced and when it is passed to a function.
-This includes a dereference in a return statement.
+This includes a dereference in a return statement. A return statement that
+does not dereference the pointer does not lead to a report. Such a case is
+reported by the :ref:`core-StackAddressEscape` checker.
 
 Each object is reported at most once on an execution path. If the same dangling
 pointer is used several times then only the first use is reported.
@@ -3391,9 +3393,9 @@ pointer is used several times then only the first use is reported.
    }
  }
 
-End-of-lifetime information is not included in the CFG by default. Without it
-the checker does not report anything and no error is emitted by the analyzer.
-Use the ``-analyzer-config cfg-lifetime=true`` option to include it.
+The ``-analyzer-config cfg-lifetime=true`` option is a prerequisite for these
+reports. Without it the checker does not report anything and no error is emitted
+by the analyzer.
 
 **Limitations**
 
