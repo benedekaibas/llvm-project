@@ -9,88 +9,26 @@ requests](https://github.com/llvm/llvm-project/pulls?q=is%3Apr+author%3Abenedeka
 
 ## Motivation
 
-In November 2022 the NSA published a Cybersecurity Information Sheet on software memory safety [1]. The paper recommends that organizations move away from memory
-unsafe languages such as C and C++ towards memory safe ones and it backs this recommendation with the observation that a large portion of the exploitable
-vulnerabilities found in widely used products are memory safety issues. Microsoft and the Chromium project have both reported that around 70% of their severe
-security bugs are caused by memory safety violations [2][3]. In 2024 the White House Office of the National Cyber Director repeated the same recommendation [4].
+Around 70% of the severe security bugs at Microsoft and in Chromium come from memory safety violations [2][3], and in 2022 the NSA recommended moving away from memory unsafe languages such as C and C++ [1], a
+recommendation the White House repeated in 2024 [4]. Many of them are lifetime errors, where a pointer or a reference outlives the object it points to. Rewriting the C++ that is already out there is rarely practical,
+so these bugs have to be caught in the code as it is. The Clang Static Analyzer reasons about the paths of a program without running it and teaching it to understand lifetime annotations lets it catch dangling pointers
+and references the compiler cannot detect.
 
-C and C++ are only mentioned together in these papers. Bjarne Stroustrup's P2739R0 [5] answered that this treats them as one language and disregards the
-guarantees that modern C++ and its tooling provide. One of the approaches that address the lifetime errors of this category is the lifetime profile of the C++
-Core Guidelines, defined in Herb Sutter's paper "Lifetime safety: Preventing common dangling" [6]. The paper diagnoses the common cases of dangling at compile
-time using only local analysis. It categorizes variables as Owners and Pointers, tracks what each Pointer points to over an acyclic control flow graph and stops
-at the function boundary, where it relies on the function's declaration instead of its body.
+## Background
 
-Building on the paper, Clang has a flow sensitive intra-procedural lifetime analysis behind the `-Wlifetime-safety` flag [7]. It works with an Origins and Loans
-model that is inspired by Rust's Polonius borrow checker, where an origin is the set of memory locations a pointer may refer to and a loan is a single act of
-borrowing from a memory location. It reads four annotations and treats everything else conservatively as an opaque loan. `[[gsl::Owner]]` and `[[gsl::Pointer]]`
-are the type level categories of the profile and mark a type as owning its data or as viewing somebody else's data. `[[clang::lifetimebound]]` and
-`[[clang::lifetime_capture_by(X)]]` [10] are the contracts at the function boundary and say that the returned value may refer to the annotated parameter, or that
-the object `X` may store a reference to it.
-
-The analysis is intra-procedural, because a compiler warning has to be fast enough to run on every translation unit of every build. In partially annotated code
-this means that a single missing annotation is enough to prevent `-Wlifetime-safety` from finding the bug, since as soon as the lifetime of a value travels
-through a function that carries no annotation the analysis has to treat that function as opaque and stay silent. This is where the Clang Static Analyzer can
-help, because it performs path sensitive symbolic execution and it can inline the body of the callee, so it can follow the lifetime through the unannotated
-function and fall back to the annotation only where inlining is not an option.
-
-The following example shows this gap:
-
-```cpp
-int *test_func(int *p [[clang::lifetimebound]]);
-
-int *wrapper(int *q) { return test_func(q); }
-
-int *caller() {
-  int y = 5;
-  return wrapper(&y);
-}
-```
-
-The annotation on `p` is the contract of `test_func`: the value it returns may refer to whatever `p` refers to. `wrapper` passes that value on unchanged, so what
-`caller` returns may refer to `y`, whose lifetime ends when `caller` returns. Because `wrapper` carries no annotation, `-Wlifetime-safety` treats its return
-value as an opaque loan, and `-Wall`, `-Wextra`, `-Wdangling` and `-Wreturn-stack-address` do not report it ([Compiler Explorer](https://godbolt.org/z/n6rx7fqze)).
-The CSA inlines `wrapper`, sees the annotated call inside it, binds the returned value to `y` and reports the bug with the path that leads to it:
-
-```text
-warning: Returning value bound to 'y' that will go out of scope [alpha.cplusplus.UseAfterLifetimeEnd]
-    6 |   int y = 5;
-      |       ~
-    7 |   return wrapper(&y);
-      |   ^~~~~~~~~~~~~~~~~~
-note: 'y' initialized here
-    6 |   int y = 5;
-      |   ^~~~~
-note: Calling 'wrapper'
-    7 |   return wrapper(&y);
-      |          ^~~~~~~~~~~
-note: Value's lifetime bound to the lifetime of 'y' here
-    3 | int *wrapper(int *q) { return test_func(q); }
-      |                                         ^
-note: Returning from 'wrapper'
-    7 |   return wrapper(&y);
-      |          ^~~~~~~~~~~
-note: Lifetime of 'y' ended here
-    6 |   int y = 5;
-      |       ~
-    7 |   return wrapper(&y);
-      |   ^~~~~~~~~~~~~~~~~~
-```
+Clang has a lifetime analysis behind the `-Wlifetime-safety` flag [7], inspired by Rust's Polonius borrow checker. It works with an Origins and Loans model. An origin is the set of memory locations a pointer may refer to
+and a loan is a single act of borrowing from one. Together they tell whether a pointer still refers to something alive. The analysis also reads lifetime annotations such as `[[clang::lifetimebound]]` and
+`[[clang::lifetime_capture_by(X)]]` [10]. `-Wlifetime-safety` has to run on every translation unit of every build, so it is intra-procedural. That makes a single missing annotation enough to hide a bug. Once the value
+travels through an unannotated function in the chain, the analysis treats it as opaque and stays silent. This project closes that gap by teaching the CSA to read the same annotations and to follow the lifetime through the
+function chain by inlining.
 
 ## The goal of the project
 
-The goal of the project is to teach the CSA to read the lifetime annotations and to track the resulting lifetime dependencies along each execution path, so that
-it can help the compiler out in the cases where the compiler level analysis does not detect the bug.
-
-I implemented this as a modeling checker that owns the program state and reporting checkers that consume it:
-
-- `LifetimeModeling.cpp`: this is the modeling checker which models the `[[clang::lifetimebound]]` annotation and maintains the lifetime origin state that the
-  reporting checkers consume. It subscribes to the CFG's lifetime end elements through `check::LifetimeEnd` and records when a stack object's lifetime ends.
-- `UseAfterLifetimeEnd.cpp`: this is the annotation driven checker that warns on lifetime errors in annotated code. On a return statement it warns when the
-  returned value is bound to a local that is about to go out of scope.
-- `DanglingPtrDeref.cpp`: this checker reports uses of a pointer after the stack object it points to has gone out of scope. The checker is not annotation driven,
-  it subscribes to `check::Location` so on every load or store through a pointer it asks the modeling checker whether the pointee's lifetime has already ended.
-- `DebugLifetimeModeling`: a debug checker that dumps the lifetime origins recorded by the modeling checker, which is what made the state observable in the lit
-  tests.
+This project closes that gap by giving the CSA the same contracts the compiler reads. When the analyzer can inline a callee it follows the lifetime through the chain itself and does not need the annotation at all.
+When it cannot inline the callee then the annotation is what it falls back on. That combination lets it report two things the compiler stays silent about: a value that is returned while it still borrows from the
+frame it leaves and a pointer that is dereferenced or passed on after its object has gone out of scope. The analyzer works path by path which means every report carries the execution path that leads to the bug. The path
+shows where the value was borrowed and where its storage died. Both checkers are in Clang today and remain in the alpha package until they are stable. The rest of this report shows how they were built and what they catch
+that the compiler misses. The future work section describes what is left to do.
 
 ## Implementation
 
