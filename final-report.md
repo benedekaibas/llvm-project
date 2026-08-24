@@ -75,20 +75,35 @@ that the compiler misses. The future work section describes what is left to do.
 
 ## Implementation
 
-The order of the work was set by dependencies. Nothing can report a dangling pointer before something records where a value borrows from. Nothing can record
-that before the annotation is visible to a checker and there is a place to keep what it learned. The summer followed that order: read the annotation, model the
-relationship, add the two reporting checkers, then cut false positives, sharpen the reports and document both checkers.
-
 ### From an attribute to a report
 
-Clang attaches `[[clang::lifetimebound]]` to the annotated `ParmVarDecl`, so the contract is in the AST before the analyzer starts. It becomes usable in
-`checkPostCall`: the call has been evaluated, so the return value and every argument have an `SVal` and the checker can pair the returned value with the region
-of the argument it borrows from.
+Nothing can be reported before the analyzer records where a value borrows from, so that recording came first. Clang attaches `[[clang::lifetimebound]]` to the
+annotated `ParmVarDecl`, so the contract is in the AST before the analyzer starts. It becomes usable in `checkPostCall`: the call has been evaluated, so the
+return value and every argument have an `SVal` and the checker can pair the returned value with the region of the argument it borrows from.
 
 The harder half was where to keep that pair. Every `ProgramState` carries a generic data map next to the store and the constraints, a key-value area where a
 checker registers a container of its own. What lives there is path specific. It is duplicated when a branch splits the exploration and dropped when the analyzer
-backtracks, so a borrow that only exists when a condition holds stays on that branch. That property is what the whole project rests on and it is free once the
-data lives in the right place.
+backtracks, so a borrow that only exists when a condition holds stays on that branch. Path sensitivity is what separates this from the intra-procedural
+analysis, and it costs nothing once the data lives in the right place.
+
+```text
+              ProgramState of the node before the branch
+              +-------------------------------------+
+              | environment, store                  |
+              | generic data map                    |
+              |   LifetimeBoundMap   (empty)        |
+              +-------------------------------------+
+                              |
+                   if (cond) p = borrow(&y);
+                     /                    \
+              cond true                cond false
+   +------------------------------+   +------------------------------+
+   |  LifetimeBoundMap            |   |  LifetimeBoundMap            |
+   |    returned value -> { y }   |   |    (empty)                   |
+   +------------------------------+   +------------------------------+
+     the successor nodes on this        the nodes on this path never
+     path carry the borrow              see the entry
+```
 
 ```cpp
 int *test_func(int *p [[clang::lifetimebound]]);
@@ -156,62 +171,47 @@ note: Lifetime of 'y' ended here
       |   ^~~~~~~~
 ```
 
-My first attempt did all of this in one checker: it read the annotation, wrote the pair into the state and emitted the warning. That is what the review pushed
-back on, and the reasoning was the useful part of my first month. A checker that both owns state and reports bugs cannot be reused, and two checkers writing the
-same state entry make the order of the transitions part of the semantics.
+Because a checker that both owns state and reports bugs cannot be reused, I decided to split the logic into two checkers. This allows other checkers to reuse the state and makes the reporting logic independent.
 
 - [#200143](https://github.com/llvm/llvm-project/pull/200143) and [#200145](https://github.com/llvm/llvm-project/pull/200145) — the prototype, closed after the review
 - [#205521](https://github.com/llvm/llvm-project/pull/205521) — the `UseAfterLifetimeEnd` checker
 
 ### One writer for the state
 
-`LifetimeModeling` owns everything that touches the program state and exposes nothing but queries. The reporting checkers (`UseAfterLifetimeEnd` and `DanglingPtrDeref`)
-read it, decide whether what they see is a bug and build the report that explains the path to it.
+With the borrow recorded, the next question was who is allowed to write it. `LifetimeModeling` owns everything that touches the program state and exposes nothing but queries. The reporting checkers
+(`UseAfterLifetimeEnd` and `DanglingPtrDeref`) read it, decide whether what they see is a bug and build the report that explains the path to it.
 
 ```text
-                        source code + [[clang::lifetimebound]]
-                                        |
-                                        v
-   +--------------------------------------------------------------------+
-   |                          LifetimeModeling                           |
-   |             the only checker that writes program state              |
-   |                                                                     |
-   |   checkPostCall  ------------->  LifetimeBoundMap                   |
-   |     reads the annotation         value -> { source regions }        |
-   |                                                                     |
-   |   checkLifetimeEnd  ---------->  DeallocatedSourceSet               |
-   |     a scope just ended           { regions that are gone }          |
-   |                                                                     |
-   |   checkDeadSymbols  ---------->  drops entries the analyzer         |
-   |                                  can no longer reach                |
-   |                                                                     |
-   |                                  ReportedDeadRegions                |
-   |                                  { already warned about }           |
-   +--------------------------------------------------------------------+
-            ^                                            ^
-            | getDanglingRegionsAfterReturn()            | isDeallocated()
-            | isBoundToLifetimeSource()                  | markAsReported()
-            |                                            |
-   +--------+---------------------+      +---------------+------------------+
-   |     UseAfterLifetimeEnd      |      |         DanglingPtrDeref         |
-   |     check::EndFunction       |      |   check::Location, PostCall      |
-   |                              |      |                                  |
-   |  the value being returned    |      |  a pointer is used and the       |
-   |  still borrows from a local  |      |  object it points to is gone     |
-   +------------------------------+      +----------------------------------+
+   [[clang::lifetimebound]]                    end of a scope
+              \                                      /
+               v                                    v
+        +--------------------------------------------------+
+        |                LifetimeModeling                  |
+        |        the only checker that writes state        |
+        |                                                  |
+        |   what borrows from what  |  what has died       |
+        +--------------------------------------------------+
+                    |                          |
+                    | queries                  | queries
+                    v                          v
+        +----------------------+    +--------------------------+
+        | UseAfterLifetimeEnd  |    |     DanglingPtrDeref     |
+        | a returned value     |    | a pointer used after     |
+        | outlives its frame   |    | its object is gone       |
+        +----------------------+    +--------------------------+
 ```
 
 - [#205951](https://github.com/llvm/llvm-project/pull/205951) — moves every state operation into `LifetimeModeling`
 
 ### Catching a use after the scope ends
 
-The annotation only covers what somebody annotated. The other half of the problem needs no annotation at all: a pointer used after the object it points to has
-gone out of scope. That half was not implementable when the summer started. It became possible on June 8, when Arseniy Zaostrovnykh's [#201123](https://github.com/llvm/llvm-project/pull/201123) added
-handling of the `CFGLifetimeEnds` element and produced a `checkLifetimeEnd` callback for each occurrence of it. `LifetimeModeling` now listens to that callback and adds 
-the region to `DeallocatedSourceSet`, and `checkPreStmt(DeclStmt)` clears a variable's region from that set whenever its declaration is executed, so a stale entry cannot
-make fresh storage look dead.
+The annotated case was now covered. The second kind of lifetime error needs no annotation at all: a pointer used after the object it points to has gone out of
+scope. While the modelling was taking shape in June, Arseniy Zaostrovnykh added `CFGLifetimeEnds` handling to the analyzer, which turns every end of a scope
+into a `checkLifetimeEnd` callback and lets the CSA reason about lifetimes directly. I picked it up as soon as it landed and built `DanglingPtrDeref` on top of
+it. `LifetimeModeling` listens to that callback and adds the region to `DeallocatedSourceSet`. `checkPreStmt(DeclStmt)` clears a variable's region from that set
+whenever its declaration is executed, so a stale entry cannot make fresh storage look dead.
 
-The reporting side subscribes to `check::Location` and asks on every load and store through a pointer whether the pointee is gone.
+`DanglingPtrDeref` subscribes to `check::Location` and asks on every load and store through a pointer whether the pointee is gone.
 
 ```cpp
 void use_after_scope() {
@@ -244,7 +244,7 @@ note: 'num' is destroyed here
       |   ^
 note: Use of 'num' after its lifetime ended
     7 |   *ptr = 6;
-    
+      |   ~~~~~^~~
 ```
 
 - [#206460](https://github.com/llvm/llvm-project/pull/206460) — the first version, closed
@@ -252,10 +252,9 @@ note: Use of 'num' after its lifetime ended
 
 ### A pointer that is only passed on
 
-Testing on the LLVM project showed the first hole immediately: a dangling pointer handed to another function went unreported. `check::Location` does not fire there
-because the load at a call site is the load of the pointer variable itself and not an access through the pointer. `DanglingPtrDeref` now also implements `checkPostCall`
-and inspects every argument, but only when the callee was not analyzed. If the analyzer went into the body then `checkLocation` already covers every dereference in there
-and reporting at the call site as well would produce the same bug twice.
+While evaluating the first version of the checker I found a case it did not cover: a dangling pointer handed to another function. `check::Location` does not fire there because the load at a call site is the load of the
+pointer variable itself and not an access through the pointer. `DanglingPtrDeref` now also implements `checkPostCall` and inspects every argument, but only when the analyzer did not step into the callee's body. If it did,
+`checkLocation` already covers every dereference in there and reporting at the call site as well would produce the same bug twice.
 
 ```cpp
 void escape(int *ptr);
@@ -270,36 +269,24 @@ void passing_dangling_ptr_to_opaque_func() {
 }
 ```
 
-```console
-$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
-        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp
-```
-
 ```text
-warning: Use of 'num' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
-    9 |   escape(ptr);
-      |   ^~~~~~~~~~~
-note: 'num' initialized to 5
-    6 |     int num = 5;
-      |     ^~~~~~~
-note: Value assigned to 'ptr'
-    7 |     ptr = &num;
-      |     ^~~~~~~~~~
-note: 'num' is destroyed here
-    8 |   }
-      |   ^
-note: Use of 'num' after its lifetime ended
-    9 |   escape(ptr);
-      |   ^~~~~~~~~~~
+   escape(ptr);
+        |
+        +-- check::Location fires once, for the load of 'ptr'
+        |      location it is given:   the region of 'ptr'   (alive)
+        |      'num' is only the value that comes out of that load, never the location
+        |      so the callback has nothing dead to look at
+        |
+        +-- checkPostCall sees the call after it was evaluated
+               argument SVal:  &num   ->  its lifetime has ended  ->  report
 ```
 
 - [#211045](https://github.com/llvm/llvm-project/pull/211045) — inspects call arguments in `checkPostCall`
 
 ### A pointer into part of a dead object
 
-The second hole was subobjects. A pointer can point at a field, an array element or a base class subobject, while what the modeling checker recorded as
-deallocated was the region of the whole object. `isDeallocated` now looks up the base region of the region it is asked about, so a pointer into any part of a
-dead object is recognized as dangling.
+So far we only talked about primitive types, but C++ also has aggregates and inheritance as well. A pointer can point at a field, an array element or a base class subobject, while what the modeling checker recorded as
+deallocated was the region of the whole object. `isDeallocated` now looks up the base region of the region it is asked about, so a pointer into any part of a dead object is recognized as dangling.
 
 ```cpp
 struct MyBuffer {
@@ -316,32 +303,24 @@ char member_subregion_dangling_deref() {
 }
 ```
 
-```console
-$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
-        -analyzer-config cfg-lifetime=true -analyzer-output=text example.cpp
-```
-
 ```text
-warning: Use of 'tmp_buffer.buffer[0]' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
-   11 |   return *p;
-      |          ^~
-note: Initializing to 0
-    8 |     MyBuffer tmp_buffer = {};
-      |     ^~~~~~~~~~~~~~~~~~~
-note: 'tmp_buffer.buffer[0]' is destroyed here
-   10 |   }
-      |   ^
-note: Use of 'tmp_buffer.buffer[0]' after its lifetime ended
-   11 |   return *p;
+   p = tmp_buffer.buffer;   ->   p points at   ElementRegion  tmp_buffer.buffer[0]
+                                                     |
+                                  getBaseRegion()    |   FieldRegion  tmp_buffer.buffer
+                                                     v
+                                                VarRegion  tmp_buffer
+
+   checkLifetimeEnd records the region of the variable that died:  { tmp_buffer }
+   a lookup of the element region misses it, so isDeallocated asks for the base
+   region first and finds the entry
 ```
 
 - [#211552](https://github.com/llvm/llvm-project/pull/211552) — matches dangling subobjects by their base region
 
 ### Making it quiet enough for real code
 
-At this point of the summer both checkers worked on their own tests, which says very little. I ran them over the LLVM monorepo, where practically every report is a false
-positive and the exercise is really a measurement of how much noise the checkers make. That run produced more work than any single feature did, and three
-classes came back.
+With both checkers passing their own tests, the next step was a large real code base. The LLVM monorepo is a good test bed: it is large, actively maintained and heavily reviewed, so it exercises code shapes no hand written
+test suite covers. Every report has to be read on its own. The ones I went through fell into three classes, each a place where the model was too coarse, and closing them made both checkers more precise.
 
 **A `lifetimebound` call during destruction.** A destructor is the one place where handing out a borrow of the dying object is normal: the caller is the
 destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor.
@@ -382,50 +361,78 @@ warnings that all describe the same bug. `markAsReported` keeps the first and dr
 - [#213779](https://github.com/llvm/llvm-project/pull/213779) — discards sources owned by another frame
 - [#215409](https://github.com/llvm/llvm-project/pull/215409) — reports each region once
 
-## Patches
-
-Each step in the Implementation section names the patch that carried it. The patches below did the work around those steps: the diagnostics, the documentation, the
-cleanups and what is still in review.
-
-**Diagnostics**
-
-- [#207052](https://github.com/llvm/llvm-project/pull/207052): implemented a `BugReporterVisitor` for `UseAfterLifetimeEnd` that adds the note showing where the value's lifetime was bound to its source.
-- [#211818](https://github.com/llvm/llvm-project/pull/211818): added `trackExpressionValue` to `DanglingPtrDeref` so the report shows where the dangling value originated.
-- [#212158](https://github.com/llvm/llvm-project/pull/212158): replaced the debug only `getString()` with `getDescriptiveName()` in the diagnostics, added the shared `getRegionName()` helper and switched the path notes to `trackStoredValue()`.
-- [#215651](https://github.com/llvm/llvm-project/pull/215651): underlined only the parameter that the return value is actually bound to when a function has several parameters.
-- [#215905](https://github.com/llvm/llvm-project/pull/215905): corrected the highlighted range so it matches the variable the note refers to.
-
-**Documentation**
-
-- [#216688](https://github.com/llvm/llvm-project/pull/216688): documentation for `DanglingPtrDeref`.
-- [#217122](https://github.com/llvm/llvm-project/pull/217122): documentation for `UseAfterLifetimeEnd`.
-
-**Fixes and cleanups**
-
-- [#207472](https://github.com/llvm/llvm-project/pull/207472): my first attempt at the destructor false positive, closed in favour of [#210801](https://github.com/llvm/llvm-project/pull/210801).
-- [#209862](https://github.com/llvm/llvm-project/pull/209862): NFC, corrected the `DanglingPtrDeref` checker's filename.
-- [#211582](https://github.com/llvm/llvm-project/pull/211582): NFC, rewrote the destructor frame walk with `llvm::any_of`.
-- [#212254](https://github.com/llvm/llvm-project/pull/212254): NFC, added test cases to the lifetime test suite.
-
-**In review**
-
-- [#214823](https://github.com/llvm/llvm-project/pull/214823) and [#214824](https://github.com/llvm/llvm-project/pull/214824): aggregate value tracking in `LifetimeModeling`, which is what `std::string_view` and `std::span` need, with [#214825](https://github.com/llvm/llvm-project/pull/214825) consuming it in `DanglingPtrDeref`.
-- [#214245](https://github.com/llvm/llvm-project/pull/214245): removes `getRegionName` from the modeling checker and its consumers.
-- [#216739](https://github.com/llvm/llvm-project/pull/216739): moves both checkers from `alpha.cplusplus` to `alpha.core`.
-
-**Outside the project**
-
-- [#212883](https://github.com/llvm/llvm-project/pull/212883): NFC, matched the parameter order of `getEndPath` and `finalizeVisitor` with `VisitNode`.
-- [#210474](https://github.com/llvm/llvm-project/pull/210474): added `[[clang::lifetimebound]]` annotations to `Twine.h`.
-- [#196602](https://github.com/llvm/llvm-project/pull/196602): fixed use-after-move detection for the three argument `std::move`.
-- [#186303](https://github.com/llvm/llvm-project/pull/186303): removed a stale FIXME and its workaround from `InnerPointerBRVisitor`.
-
 ## Results
 
-None of the three cases below is caught by `-Wlifetime-safety` or by the CSA running its `core` checkers. Each one is caught by one of the two new lifetime checkers, as
-the run under every example shows.
+Both checkers are in Clang today and they report bugs that nothing else in the toolchain reports. The analyzer had no model of `[[clang::lifetimebound]]` at
+all. `-Wlifetime-safety` does read it, but it has to run on every translation unit of every build, so it stops at the first call it cannot see into. Each case
+below is ordinary C++ that the compiler and the analyzer's existing checkers pass over in silence.
 
-### The annotated function cannot be inlined
+### The analyzer had nothing to say about a dead stack object
+
+```cpp
+void use_after_scope() {
+  int *ptr = nullptr;
+  {
+    int num = 5;
+    ptr = &num;
+  }
+  *ptr = 6;
+}
+```
+
+None of the analyzer's existing checkers for this kind of error cover it, `core.StackAddressEscape` and `cplusplus.InnerPointer` included: with
+`-analyzer-checker=core,cplusplus` the analyzer produces no diagnostic at all. `DanglingPtrDeref` reports it.
+
+```console
+$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
+        -analyzer-config cfg-lifetime=true -analyzer-output=text use-after-scope.cpp
+```
+
+```text
+warning: Use of 'num' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
+    7 |   *ptr = 6;
+      |   ~~~~~^~~
+note: 'num' initialized to 5
+    4 |     int num = 5;
+      |     ^~~~~~~
+note: Value assigned to 'ptr'
+    5 |     ptr = &num;
+      |     ^~~~~~~~~~
+note: 'num' is destroyed here
+    6 |   }
+      |   ^
+note: Use of 'num' after its lifetime ended
+    7 |   *ptr = 6;
+      |   ~~~~~^~~
+```
+
+### One unannotated call and the compiler goes quiet
+
+The compiler handles the direct case. With the local passed straight to the annotated parameter, `-Wlifetime-safety` says so:
+
+```cpp
+const char *findOption(const char *config [[clang::lifetimebound]], const char *key);
+
+const char *readTimeoutDirect() {
+  char config[64] = "timeout=30";
+  return findOption(config, "timeout");
+}
+```
+
+```text
+warning: address of stack memory associated with local variable 'config' returned [-Wreturn-stack-address]
+    5 |   return findOption(config, "timeout");
+      |                     ^~~~~~
+warning: stack memory associated with local variable 'config' is returned [-Wlifetime-safety-return-stack-addr]
+    5 |   return findOption(config, "timeout");
+      |                     ^~~~~~
+note: returned here
+    5 |   return findOption(config, "timeout");
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+```
+
+Put one unannotated function between the local and the annotated call and the warning disappears, because the analysis cannot look inside `optionValue` and
+`optionValue` carries no contract of its own. A chain only has to lose one link for the diagnostic to go with it.
 
 ```cpp
 // Defined in another translation unit.
@@ -441,8 +448,8 @@ const char *readTimeout() {
 }
 ```
 
-`findOption` is only declared so there is no body to inline, and `optionValue` carries no annotation of its own. The CSA inlines `optionValue`, hits the annotated call inside it and falls back on the contract. The report
-names `config[0]` because that is the region the array decays to at the call.
+The CSA inlines `optionValue`, reaches the annotated call inside it and falls back on the contract. The report names `config[0]` because that is the region the
+array decays to at the call.
 
 ```console
 $ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.UseAfterLifetimeEnd \
@@ -467,85 +474,7 @@ note: Lifetime of 'config[0]' ended here
       |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ```
 
-### The pointer dangles on one path only
-
-```cpp
-int *pickBuffer(int *scratch, int *shared, bool useScratch) {
-  return useScratch ? scratch : shared;
-}
-
-void resize(int width) {
-  int shared = 80;
-  int *buffer = nullptr;
-  {
-    int scratch = width * 2;
-    buffer = pickBuffer(&scratch, &shared, width > 0);
-  }
-  *buffer += 1;
-}
-```
-
-`buffer` is dangling only when `width > 0` holds. On the other path it points to `shared`, which outlives the block, so a single merged answer for the function has to be either silent or wrong.
-
-```text
-        buffer = pickBuffer(&scratch, &shared, width > 0)
-                       /                         \
-      width > 0 true  /                           \  width > 0 false
-                     v                             v
-        buffer -> scratch                   buffer -> shared
-                     |                             |
-   }  <- scratch dies here                         |  shared outlives the block
-                     |                             |
-             *buffer += 1                    *buffer += 1
-                     |                             |
-                  WARNING                          ok
-```
-
-The CSA keeps the two paths apart, reports the left one and prints the condition that leads there.
-
-```console
-$ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
-        -analyzer-config cfg-lifetime=true -analyzer-output=text pick-buffer.cpp
-```
-
-```text
-warning: Use of 'scratch' after its lifetime ended [alpha.cplusplus.DanglingPtrDeref]
-   12 |   *buffer += 1;
-      |   ~~~~~~~~^~~~
-note: 'scratch' initialized here
-    9 |     int scratch = width * 2;
-      |     ^~~~~~~~~~~
-note: Assuming 'width' is > 0
-   10 |     buffer = pickBuffer(&scratch, &shared, width > 0);
-      |                                            ^~~~~~~~~
-note: Passing value via 1st parameter 'scratch'
-   10 |     buffer = pickBuffer(&scratch, &shared, width > 0);
-      |                         ^~~~~~~~
-note: Calling 'pickBuffer'
-   10 |     buffer = pickBuffer(&scratch, &shared, width > 0);
-      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-note: 'useScratch' is true
-    2 |   return useScratch ? scratch : shared;
-      |          ^~~~~~~~~~
-note: '?' condition is true
-note: Returning pointer
-    2 |   return useScratch ? scratch : shared;
-      |   ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-note: Returning from 'pickBuffer'
-   10 |     buffer = pickBuffer(&scratch, &shared, width > 0);
-      |              ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-note: Value assigned to 'buffer'
-   10 |     buffer = pickBuffer(&scratch, &shared, width > 0);
-      |     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-note: 'scratch' is destroyed here
-   11 |   }
-      |   ^
-note: Use of 'scratch' after its lifetime ended
-   12 |   *buffer += 1;
-      |   ~~~~~~~~^~~~
-```
-
-### The borrow is created inside another function
+### A borrow made in one function and used in another
 
 ```cpp
 void submit(const int *sample);
@@ -562,7 +491,8 @@ void collectSample(int reading) {
 }
 ```
 
-`keep` carries no annotation, and `sample` is never dereferenced in `collectSample`, it is only handed to `submit`. The CSA inlines `keep`, follows the pointer back to `corrected` and reports the call that passes it on.
+Neither function is annotated and `sample` is never dereferenced in `collectSample`. `-Wlifetime-safety` sees `keep` as an opaque call and has no origin to
+follow, so it stays silent. The CSA inlines `keep`, follows the pointer back to `corrected` and reports the call that passes it on.
 
 ```console
 $ clang -cc1 -analyze -analyzer-checker=core,alpha.cplusplus.DanglingPtrDeref \
@@ -589,6 +519,12 @@ note: Use of 'corrected' after its lifetime ended
    11 |   submit(sample);
       |   ^~~~~~~~~~~~~~
 ```
+
+Together the two checkers move lifetime checking past the point where the compiler has to stop. `-Wlifetime-safety` remains the right tool for the common case,
+because it is cheap enough to run on every build. What it cannot do is follow a value through a call it cannot see into, and a chain only has to lose one link
+for the warning to disappear. Every report the checkers produce carries the execution path from the borrow to the death of the storage, including the branch
+that had to be taken, so the reader can judge it without rerunning the analysis. Both checkers ship in Clang today, both have been run over the LLVM monorepo,
+and `LifetimeModeling` is a base that the next lifetime checker can consume instead of rebuilding.
 
 
 ## Future work
@@ -622,7 +558,11 @@ continuing to contribute to the Clang Static Analyzer in general.
 
 ## Special thanks
 
+I would like to say thank you to my mentors, in the order they appear on the LLVM GSoC page: Gábor Horváth, Balázs Benics and Dániel Domján, for mentoring this project, for the reviews and design discussions that shaped
+both checkers and for answering my questions throughout the summer. The time they put into the project and into teaching me went well beyond what I expected. My questions were answered quickly and my patches were reviewed
+even at weekends. 
 
+I would also like to say thank you to Donát Nagy for his code reviews on some of these patches and to Arseniy Zaostrovnykh for the `CFGLifetimeEnds` support in the CFG.
 
 ## References
 
