@@ -317,10 +317,12 @@ char member_subregion_dangling_deref() {
 
 - [#211552](https://github.com/llvm/llvm-project/pull/211552) — matches dangling subobjects by their base region
 
-### Making it quiet enough for real code
+## Testing the lifetime checkers
 
-With both checkers passing their own tests, the next step was a large real code base. The LLVM monorepo is a good test bed: it is large, actively maintained and heavily reviewed, so it exercises code shapes no hand written
-test suite covers. Every report has to be read on its own. The ones I went through fell into three classes, each a place where the model was too coarse, and closing them made both checkers more precise.
+Running the checkers on a real project does two things. It shows they hold up outside the cases I wrote tests for and it measures the property that decides whether a checker can leave `alpha`: how rarely it reports
+something that is not a bug. A core checker is expected to have very few false positives and that number cannot come from a hand written suite. The LLVM monorepo is large, actively maintained and heavily reviewed, so it
+exercises shapes my tests never reach. Every report there has to be read on its own and the ones I went through fell into three classes each a place where the model was too coarse. Closing them made both checkers more
+precise and moved them closer to the bar a core checker has to meet.
 
 **A `lifetimebound` call during destruction.** A destructor is the one place where handing out a borrow of the dying object is normal: the caller is the
 destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor.
