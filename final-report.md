@@ -594,8 +594,8 @@ the LLVM monorepo alone libc++ applies `_LIBCPP_LIFETIMEBOUND` around 80 times a
 `ABSL_ATTRIBUTE_LIFETIME_BOUND` [9] and uses it throughout its string and container types, while `lifetime_capture_by` is a much newer addition [10]. Supporting the capture annotation is the work I intend to do after the
 summer.
 
-**Maintenance.** I intend to maintain these checkers. That means fixing the false positives that will show up once people enable them on their own code bases, moving them out of `alpha` once they are stable enough, and
-continuing to contribute to the Clang Static Analyzer in general.
+**Maintenance.** After the summer ends I would like to finish the work described above and to keep these checkers in shape as people enable them on their own code bases. I hope to stay involved with the Clang Static
+Analyzer more broadly.
 
 ## Special thanks
 
