@@ -326,24 +326,40 @@ test suite covers. Every report has to be read on its own. The ones I went throu
 destructor itself and the borrow does not escape it. The fix walks the frames on the current stack and suppresses the report if any of them is a destructor.
 
 ```text
-   +-------------------------------------------------+
-   |  Widget::~Widget()          <- destructor frame  |
-   |     Widget::getName()       [[lifetimebound]]    |
-   +-------------------------------------------------+
-      any destructor frame on the stack  ->  no report
+   struct S {                                             call stack
+     int x;
+     int *get() [[clang::lifetimebound]]             +----------------------+
+       { return &x; }                                |  outer()             |
+     ~S() { get(); }                                 +----------------------+
+   };                                                |  passThrough()       |  the S dies here
+                                                     +----------------------+
+   S passThrough(S param) { return param; }          |  S::~S()             |  <- destructor frame
+                                                     +----------------------+
+   void outer() {                                    |  S::get()            |  returns &x, a borrow
+     auto f = passThrough(make());   --------------> +----------------------+  of *this
+   }
+
+   a destructor frame is on the stack, so the borrow get() hands out is meant to die
+   with the object  ->  no report
 ```
 
 **A source owned by another frame.** This was the largest of the three classes. A returned value can only dangle if the frame that owns its lifetime source is the frame being left. When the source belongs to a caller that
 stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing to report. 
 
 ```text
-   caller()                          owns 'buf', stays alive
-      |  &buf
-      v
-   helper()  returns a value bound to 'buf'
-      |
-      v  helper's frame dies here, caller's does not
-   no report: the owning frame is still on the stack
+   const char *first(const char *buf [[clang::lifetimebound]]);
+   void use(const char *p);                                  call stack
+
+   const char *helper(const char *buf) {               +----------------------+
+     return first(buf);                                |  caller()            |  owns 'buf'
+   }                                                   +----------------------+
+                                                       |  helper()            |  <- frame being left
+   void caller() {                                     +----------------------+
+     char buf[64] = {};                                  returns a value bound
+     use(helper(buf));   ---------------------------->   to 'buf'
+   }
+
+   'buf' belongs to caller(), which stays alive when helper() returns  ->  no report
 ```
 
 **The same variable reported again and again.** `checkLocation` fires on every access through a pointer, so a dead variable used five times produced five
