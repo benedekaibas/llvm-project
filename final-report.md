@@ -333,9 +333,8 @@ destructor itself and the borrow does not escape it. The fix walks the frames on
       any destructor frame on the stack  ->  no report
 ```
 
-**A source owned by another frame.** This produced most of the noise. A returned value can only dangle if the frame that owns its lifetime source is the frame
-being left. When the source belongs to a caller that stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing
-to report.
+**A source owned by another frame.** This was the largest of the three classes. A returned value can only dangle if the frame that owns its lifetime source is the frame being left. When the source belongs to a caller that
+stays alive, or to a frame the analyzer never entered, the storage outlives the value and there is nothing to report. 
 
 ```text
    caller()                          owns 'buf', stays alive
@@ -360,6 +359,32 @@ warnings that all describe the same bug. `markAsReported` keeps the first and dr
 - [#210801](https://github.com/llvm/llvm-project/pull/210801) — suppresses the report inside a destructor
 - [#213779](https://github.com/llvm/llvm-project/pull/213779) — discards sources owned by another frame
 - [#215409](https://github.com/llvm/llvm-project/pull/215409) — reports each region once
+
+## Patches
+
+Each step in the Implementation section names the patch that carried it. The patches below did the work around those steps: the diagnostics, the documentation, the cleanups and what is still in review. Within each group
+the patches follow the order I opened them over the summer.
+
+**Diagnostics**
+
+- [#207052](https://github.com/llvm/llvm-project/pull/207052): implemented a `BugReporterVisitor` for `UseAfterLifetimeEnd` that adds the note showing where the value's lifetime was bound to its source.
+- [#211818](https://github.com/llvm/llvm-project/pull/211818): added `trackExpressionValue` to `DanglingPtrDeref` so the report shows where the dangling value originated.
+- [#212158](https://github.com/llvm/llvm-project/pull/212158): replaced the debug only `getString()` with `getDescriptiveName()` in the diagnostics, added the shared `getRegionName()` helper and switched the path notes to `trackStoredValue()`.
+- [#215651](https://github.com/llvm/llvm-project/pull/215651): underlined only the parameter that the return value is actually bound to when a function has several parameters.
+- [#215905](https://github.com/llvm/llvm-project/pull/215905): corrected the highlighted range so it matches the variable the note refers to.
+
+**Documentation**
+
+- [#216688](https://github.com/llvm/llvm-project/pull/216688): documentation for `DanglingPtrDeref`.
+- [#216739](https://github.com/llvm/llvm-project/pull/216739): moves both checkers from `alpha.cplusplus` to `alpha.core`.
+- [#217122](https://github.com/llvm/llvm-project/pull/217122): documentation for `UseAfterLifetimeEnd`.
+
+**Fixes and cleanups**
+
+- [#207472](https://github.com/llvm/llvm-project/pull/207472): an earlier take on the destructor suppression, superseded by [#210801](https://github.com/llvm/llvm-project/pull/210801).
+- [#209862](https://github.com/llvm/llvm-project/pull/209862): NFC, corrected the `DanglingPtrDeref` checker's filename.
+- [#211582](https://github.com/llvm/llvm-project/pull/211582): NFC, rewrote the destructor frame walk with `llvm::any_of`.
+- [#212254](https://github.com/llvm/llvm-project/pull/212254): NFC, added test cases to the lifetime test suite.
 
 ## Results
 
