@@ -369,7 +369,8 @@ summer.
 
 I would like to say thank you to my mentors, in the order they appear on the LLVM GSoC page: Gábor Horváth, Balázs Benics and Dániel Domján, for mentoring this project, for the reviews and design discussions that shaped
 both checkers and for answering my questions throughout the summer. The time they put into the project and into teaching me went well beyond what I expected. My questions were answered quickly and my patches were reviewed
-even at weekends. 
+even at weekends. This was the greatest summer of my life so far without a doubt. I am grateful for the opportunity and for my mentors for all their help and guidance. This project gave me a huge motivation to stay active
+in the LLVM community and continue working on the lifetime checkers and the Clang Static Analyzer.
 
 I would also like to say thank you to Donát Nagy for his code reviews on some of these patches and to Arseniy Zaostrovnykh and Tomasz Kamnski for the `CFGLifetimeEnds` support in the CFG.
 
