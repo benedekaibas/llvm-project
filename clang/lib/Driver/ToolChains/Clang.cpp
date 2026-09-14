@@ -3579,7 +3579,7 @@ static void RenderAnalyzerOptions(const ArgList &Args, ArgStringList &CmdArgs,
   // Disable the presentation of standard compiler warnings when using
   // --analyze.  We only want to show static analyzer diagnostics or frontend
   // errors.
-  CmdArgs.push_back("-w");
+  // CmdArgs.push_back("-w");
 
   // Add -Xanalyzer arguments when running as analyzer.
   Args.AddAllArgValues(CmdArgs, options::OPT_Xanalyzer);
