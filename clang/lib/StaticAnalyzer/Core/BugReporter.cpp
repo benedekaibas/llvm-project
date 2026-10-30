@@ -626,11 +626,10 @@ PathDiagnosticLocation PathDiagnosticBuilder::ExecutionContinues(
   const PathDiagnosticLocation &Loc = ExecutionContinues(C);
 
   if (Loc.asStmt())
-    os << "Execution continues on line "
-       << getSourceManager().getExpansionLineNumber(Loc.asLocation())
-       << '.';
+    os << "execution continues on line "
+       << getSourceManager().getExpansionLineNumber(Loc.asLocation());
   else {
-    os << "Execution jumps to the end of the ";
+    os << "execution jumps to the end of the ";
     const Decl *D = C.getCurrStackFrame()->getDecl();
     if (isa<ObjCMethodDecl>(D))
       os << "method";
@@ -640,7 +639,6 @@ PathDiagnosticLocation PathDiagnosticBuilder::ExecutionContinues(
       assert(isa<BlockDecl>(D));
       os << "anonymous block";
     }
-    os << '.';
   }
 
   return Loc;
@@ -785,9 +783,9 @@ PathDiagnosticPieceRef PathDiagnosticBuilder::generateDiagForSwitchOP(
 
     switch (S->getStmtClass()) {
     default:
-      os << "No cases match in the switch statement. "
-        "Control jumps to line "
-        << End.asLocation().getExpansionLineNumber();
+      os << "No cases match in the switch statement; "
+            "control jumps to line "
+         << End.asLocation().getExpansionLineNumber();
       break;
     case Stmt::DefaultStmtClass:
       os << "Control jumps to the 'default' case at line "
@@ -821,7 +819,7 @@ PathDiagnosticPieceRef PathDiagnosticBuilder::generateDiagForSwitchOP(
     }
     }
   } else {
-    os << "'Default' branch taken. ";
+    os << "'Default' branch taken; ";
     End = ExecutionContinues(os, C);
   }
   return std::make_shared<PathDiagnosticControlFlowPiece>(Start, End, sbuf);
@@ -956,7 +954,7 @@ void PathDiagnosticBuilder::generateMinimalDiagForBlockEdge(
       std::string sbuf;
       llvm::raw_string_ostream os(sbuf);
 
-      os << "Loop condition is true. ";
+      os << "Loop condition is true; ";
       PathDiagnosticLocation End = ExecutionContinues(os, C);
 
       if (const Stmt *S = End.asStmt())
@@ -982,7 +980,7 @@ void PathDiagnosticBuilder::generateMinimalDiagForBlockEdge(
       std::string sbuf;
       llvm::raw_string_ostream os(sbuf);
 
-      os << "Loop condition is false. ";
+      os << "Loop condition is false; ";
       PathDiagnosticLocation End = ExecutionContinues(os, C);
       if (const Stmt *S = End.asStmt())
         End = getEnclosingStmtLocation(S, C.getCurrStackFrame());
